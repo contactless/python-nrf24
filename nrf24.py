@@ -1,25 +1,22 @@
 import time
-import spidev
-import wiringpi2 as wiringpi
+import WB_IO.GPIO as GPIO
+import WB_IO.SPI as spidev
+
 
 class Nrf24:
 
-	def __init__(self,cePin=2,csnPin=3,channel=1,payload=8):
+	def __init__(self,cePin=2, spiMajor=0, spiMinor=0, channel=1,payload=8):
 		# we use wiringPi pin numbering!
-		self.gpio = wiringpi.GPIO(wiringpi.GPIO.WPI_MODE_PINS) 
 		self.cePin = cePin      # pin number for CE
-		self.csnPin = csnPin    # pin number for CSN
 		self.channel = channel  # RF channel to be used
 		self.payload = payload	# size of payload in bytes
-		
-		self.gpio.pinMode(self.cePin,self.gpio.OUTPUT); #set ce as output
-		self.gpio.pinMode(self.csnPin,self.gpio.OUTPUT); #set csn as output
+
+		GPIO.setup(self.cePin, GPIO.OUT) #set ce as output
 
 		self.ceLow()
-		self.csnHi()
 
-		self.spi = spidev.SpiDev()
-		self.spi.open(0,0)
+		self.spi = spidev.SPI()
+		self.spi.open(spiMajor, spiMinor)
 
 
 	def printSetup(self):
@@ -27,24 +24,28 @@ class Nrf24:
 		rt_setup = self.readRegister(self.SETUP_RETR,1)
 		rf_channel = self.readRegister(self.RF_CH,1)
 		config = self.readRegister(self.CONFIG,1)
-		
+
 		print "RF_SETUP  : %s" % str(bin(rf_setup[0]))
 		print "RT_SETUP  : %s" % str(bin(rt_setup[0]))
 		print "RF_CH     : %s" % str(bin(rf_channel[0]))
 		print "CONFIG    : %s" % str(bin(config[0]))
 
-		
+
+		print "TX_ADDR    : %s" % str(self.readRegister(self.TX_ADDR,self.mirf_ADDR_LEN))
+
+
+
 	def printStatus(self):
 		fifostate = self.readRegister(self.FIFO_STATUS,1)
 		observe_tx = self.readRegister(self.OBSERVE_TX,1)
 		print "status     : %s" % str(bin(self.getStatus()))
 		print "fifo status: %s" % str(bin(fifostate[0]))
-		print "tx stats   : %s" % str(bin(observe_tx[0])) 
+		print "tx stats   : %s" % str(bin(observe_tx[0]))
 
 
-	def config(self): #void 
+	def config(self): #void
 		self.powerDown()
-		self.configRegister(self.SETUP_RETR,0b11111)
+		self.configRegister(self.SETUP_RETR	,0b11111)
 		self.configRegister(self.RF_CH, self.channel)     # set the RF channel
 		self.configRegister(self.RX_PW_P0, self.payload)  # set size of payload
 		self.configRegister(self.RX_PW_P1, self.payload)  #  for incoming pkgs
@@ -61,20 +62,15 @@ class Nrf24:
 
 		self.ceLow()
 		self.powerUpTx()
-		
-		self.csnLow()
-		self.spi.xfer2([ self.FLUSH_TX ])
-		self.csnHi()
 
-		self.csnLow()
-		self.spi.xfer2([ self.W_TX_PAYLOAD])
-		self.spi.xfer2(value)
-		self.csnHi()
-		self.ceHi()			
+		self.spi.write_then_read([ self.FLUSH_TX ], 0)
+
+		self.spi.write_then_read([ self.W_TX_PAYLOAD,] + value, 0)
+		self.ceHi()
 
 	# set the own address to receive packages
 	# raddr can be a string
-	def setRADDR(self,raddr): 
+	def setRADDR(self,raddr):
 		addr = map(ord,raddr)
 		self.ceLow()
 		self.writeRegister(self.RX_ADDR_P1,addr,self.mirf_ADDR_LEN)
@@ -82,12 +78,20 @@ class Nrf24:
 
 	# address of the device which should receive the package
 	# taddr can be a string
-	def setTADDR(self,taddr): 
+	def setTADDR(self,taddr):
 		addr = map(ord,taddr)
 		self.ceLow();
 		self.writeRegister(self.RX_ADDR_P0,addr,self.mirf_ADDR_LEN)
 		self.writeRegister(self.TX_ADDR,addr,self.mirf_ADDR_LEN)
 		self.ceHi()
+
+
+	# read taddr (as string)
+	def getTADDR(self):
+		addr_bytes = self.readRegister(self.TX_ADDR,self.mirf_ADDR_LEN)
+		return "".join(chr(x) for x in addr_bytes)
+
+
 
 
 	# check if there is data in one of the FIFOs which can be read.
@@ -101,26 +105,25 @@ class Nrf24:
 	def rxFifoEmpty(self): #bool
 		fifoStatus = self.readRegister(self.FIFO_STATUS,1)
 		return (fifoStatus[0] & (1 << self.RX_EMPTY))
-	
+
 	# check if the module is currently sending.
 	def isSending(self): #bool
 		if self.PTX > 0:
 			status = self.getStatus()
-			
+
 			if  (( status & ((1<<self.TX_DS)  | (1<<self.MAX_RT)))) is not 0:
 				self.powerUpRx()
 				return False
-			
+
 			return True
 		return False
 
 	# read available RX data from the module
 	def getData(self):
 		self.ceLow()
-		self.csnLow()
-		self.spi.writebytes([ self.R_RX_PAYLOAD ])
-		data = self.spi.xfer2([0] * self.payload)
-		self.csnHi()
+
+		data = self.spi.write_then_read([ self.R_RX_PAYLOAD, ], self.payload )
+
 		self.ceHi()
 		self.configRegister(self.STATUS,(1<<self.RX_DR))
 		return data
@@ -128,35 +131,26 @@ class Nrf24:
 
 	# read the status register
 	def getStatus(self): #uint8_t
-		self.csnLow()
-		self.spi.writebytes([self.STATUS])
-		state = self.spi.readbytes(1)
-		self.csnHi()
+		state = self.spi.write_then_read([self.STATUS], 1)
 		return state[0]
 
 	# write configurations to the register reg
 	def configRegister(self,reg,value):
-		self.csnLow()
-		self.spi.writebytes([self.W_REGISTER | (self.REGISTER_MASK & reg)])
-		self.spi.writebytes([value])
-		self.csnHi()
+		self.spi.write_then_read([self.W_REGISTER | (self.REGISTER_MASK & reg), value], 0)
 
-	# read length bytes from register reg 
+	# read length bytes from register reg
 	def readRegister(self,reg,length):
-		self.csnLow()
-		self.spi.writebytes([self.R_REGISTER | reg])
-		return_value = self.spi.readbytes(length)
-		self.csnHi()
+		return_value = self.spi.write_then_read([self.R_REGISTER | reg], length)
 		return return_value
 
 	# write bytes to register reg
 	def writeRegister(self,reg,value,length):
-		self.csnLow()
 		if not isinstance(value,list):
 			value = [value]
-		self.spi.xfer2([self.W_REGISTER | reg] + value)
-		self.csnHi()
-		
+
+		self.spi.write_then_read([self.W_REGISTER | reg] + value, 0)
+
+
 	def powerUpRx(self):
 		self.PTX = 0
 		self.ceLow()
@@ -172,29 +166,20 @@ class Nrf24:
 		self.ceLow()
 		self.configRegister(self.CONFIG,self.mirf_CONFIG)
 
-	# set CSN pin HI
-	def csnHi(self):
-		self.gpio.digitalWrite(self.csnPin, self.gpio.HIGH)
-
-	# set CSN pin LOW
-	def csnLow(self):
-		self.gpio.digitalWrite(self.csnPin, self.gpio.LOW)
 
 	# set CE pin HI
 	def ceHi(self):
-		self.gpio.digitalWrite(self.cePin, self.gpio.HIGH)
+		GPIO.output(self.cePin, GPIO.HIGH)
 
 	# set CE pin LOW
 	def ceLow(self):
-		self.gpio.digitalWrite(self.cePin, self.gpio.LOW)
+		GPIO.output(self.cePin, GPIO.LOW)
 
 	def flushRx(self):
-		self.csnLow()
-		self.spi.xfer2( [self.FLUSH_RX] )
-		self.csnHi()
+		self.spi.write_then_read( [self.FLUSH_RX], 0 )
 
-	# Memory Map 
-	PTX         = 0 
+	# Memory Map
+	PTX         = 0
 	CONFIG      = 0x00
 	EN_AA       = 0x01
 	EN_RXADDR   = 0x02
@@ -246,7 +231,7 @@ class Nrf24:
 	PLL_LOCK   =  4
 	RF_DR      =  3
 	RF_PWR     =  1
-	LNA_HCURR  =  0        
+	LNA_HCURR  =  0
 	RX_DR      =  6
 	TX_DS      =  5
 	MAX_RT     =  4
@@ -260,7 +245,7 @@ class Nrf24:
 	RX_FULL    =  1
 	RX_EMPTY   =  0
 
-	# Instruction Mnemonics 
+	# Instruction Mnemonics
 	R_REGISTER   =  0x00
 	W_REGISTER   =  0x20
 	REGISTER_MASK=  0x1F
@@ -271,6 +256,8 @@ class Nrf24:
 	REUSE_TX_PL  =  0xE3
 	NOP          =  0xFF
 
-	mirf_CONFIG  = ((1<<3) | (0<<2) )
+	#~ mirf_CONFIG  = ( ( 1 << EN_CRC) | ( 1 << CRCO) )
+	mirf_CONFIG  = ( ( 1 << EN_CRC) | ( 0 << CRCO) )
+
 	mirf_ADDR_LEN = 5
 
